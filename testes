@@ -1,1 +1,309 @@
+import asyncio
+import threading
+import time
+import queue
+import pandas as pd
+from datetime import datetime
+from bleak import BleakClient, BleakScanner
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+from typing import List, Dict, Any
+from functools import partial
 
+# --- 1. CONFIGURE OS APELIDOS (NICKNAMES) DOS SEUS SENSORES AQUI ---
+SENSOR_NICKNAMES = {
+    "A0:9E:1A:11:22:33": "Sensor Principal (Azul)",
+    "A0:9E:1A:44:55:66": "Sensor Secundário (Preto)"
+    # Adicione os endereços MAC e apelidos dos seus sensores aqui
+}
+
+# --- Configurações de Comunicação ---
+HEART_RATE_SERVICE_UUID = "0000180d-0000-1000-8000-00805f9b34fb"
+HEART_RATE_MEASUREMENT_CHAR_UUID = "00002a37-0000-1000-8000-00805f9b34fb"
+
+class PolarHRVApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Coleta de VFC - 2x Polar H10")
+        self.root.geometry("550x480")
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+        # --- Variáveis de Estado ---
+        self.master_data_log: List[Dict[str, Any]] = []
+        self.found_polar_devices = []
+        self.active_connections = {}
+        self.is_recording = False
+        self.command_queue = queue.Queue()
+        
+        self.create_widgets()
+        
+        self.async_thread = threading.Thread(target=self._async_event_loop, daemon=True)
+        self.async_thread.start()
+
+        self.update_sensor_list()
+
+    def create_widgets(self):
+        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        char_frame = ttk.LabelFrame(main_frame, text="Caracterização dos Indivíduos", padding="10")
+        char_frame.pack(fill=tk.X, pady=5)
+        
+        self.participant_vars = {'Indivíduo 1': tk.StringVar(value="Terapeuta"), 
+                                 'Indivíduo 2': tk.StringVar(value="Voluntario")}
+        ttk.Label(char_frame, text="Nome Indivíduo 1:").grid(row=0, column=0, sticky="w", pady=2)
+        ttk.Entry(char_frame, width=20, textvariable=self.participant_vars['Indivíduo 1']).grid(row=0, column=1, sticky="w", padx=5)
+        ttk.Label(char_frame, text="Nome Indivíduo 2:").grid(row=1, column=0, sticky="w", pady=2)
+        ttk.Entry(char_frame, width=20, textvariable=self.participant_vars['Indivíduo 2']).grid(row=1, column=1, sticky="w", padx=5)
+
+        status_frame = ttk.LabelFrame(main_frame, text="Atribuição dos Sensores", padding="10")
+        status_frame.pack(fill=tk.X, pady=5)
+        
+        self.sensor_vars = {'Indivíduo 1': tk.StringVar(), 'Indivíduo 2': tk.StringVar()}
+        self.sensor_menus = {}
+
+        ttk.Label(status_frame, text="Sensor para Indivíduo 1:").grid(row=0, column=0, sticky="w", pady=5)
+        self.sensor_menus['Indivíduo 1'] = ttk.Combobox(status_frame, textvariable=self.sensor_vars['Indivíduo 1'], state="readonly", width=40)
+        self.sensor_menus['Indivíduo 1'].grid(row=0, column=1, sticky="w", padx=5)
+        self.sensor_menus['Indivíduo 1'].bind("<<ComboboxSelected>>", lambda e: self.on_sensor_selected('Indivíduo 1'))
+
+        ttk.Label(status_frame, text="Sensor para Indivíduo 2:").grid(row=1, column=0, sticky="w", pady=5)
+        self.sensor_menus['Indivíduo 2'] = ttk.Combobox(status_frame, textvariable=self.sensor_vars['Indivíduo 2'], state="readonly", width=40)
+        self.sensor_menus['Indivíduo 2'].grid(row=1, column=1, sticky="w", padx=5)
+        self.sensor_menus['Indivíduo 2'].bind("<<ComboboxSelected>>", lambda e: self.on_sensor_selected('Indivíduo 2'))
+        
+        live_frame = ttk.LabelFrame(main_frame, text="Monitoramento ao Vivo", padding="10")
+        live_frame.pack(fill=tk.X, pady=10)
+
+        self.bpm_vars = {'Indivíduo 1': tk.StringVar(value="--"), 'Indivíduo 2': tk.StringVar(value="--")}
+        ttk.Label(live_frame, textvariable=self.participant_vars['Indivíduo 1']).grid(row=0, column=0, sticky="w")
+        ttk.Label(live_frame, textvariable=self.bpm_vars['Indivíduo 1'], font=("Helvetica", 20, "bold"), foreground="blue").grid(row=0, column=1, sticky="w", padx=20)
+        ttk.Label(live_frame, textvariable=self.participant_vars['Indivíduo 2']).grid(row=1, column=0, sticky="w")
+        ttk.Label(live_frame, textvariable=self.bpm_vars['Indivíduo 2'], font=("Helvetica", 20, "bold"), foreground="red").grid(row=1, column=1, sticky="w", padx=20)
+        
+        self.timer_var = tk.StringVar(value="00:00")
+        ttk.Label(live_frame, text="Tempo Restante:").grid(row=0, column=2, sticky="w", padx=20)
+        ttk.Label(live_frame, textvariable=self.timer_var, font=("Helvetica", 20, "bold"), foreground="black").grid(row=0, column=3, rowspan=2, sticky="w", padx=5)
+
+        setup_frame = ttk.LabelFrame(main_frame, text="Configuração da Gravação", padding="10")
+        setup_frame.pack(fill=tk.X, pady=10)
+        
+        ttk.Label(setup_frame, text="Duração (minutos):").grid(row=0, column=0, sticky="w", pady=5)
+        self.duration_var = tk.StringVar(value="5")
+        ttk.Entry(setup_frame, width=10, textvariable=self.duration_var).grid(row=0, column=1, sticky="w")
+        
+        control_frame = ttk.Frame(main_frame)
+        control_frame.pack(fill=tk.X, pady=10)
+        self.scan_button = ttk.Button(control_frame, text="🔄 Procurar Sensores", command=self.update_sensor_list)
+        self.scan_button.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 5))
+        self.start_button = ttk.Button(control_frame, text="▶ Iniciar Gravação", command=self.start_recording, state=tk.DISABLED)
+        self.start_button.pack(side=tk.LEFT, expand=True, fill=tk.X)
+
+        self.status_bar = ttk.Label(self.root, text="Bem-vindo!", relief=tk.SUNKEN, anchor=tk.W, padding="2 5")
+        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+
+    def update_main_status(self, text):
+        self.status_bar.config(text=text)
+
+    def update_sensor_list(self):
+        self.start_button.config(state=tk.DISABLED)
+        self.scan_button.config(state=tk.DISABLED)
+        self.update_main_status("Procurando dispositivos Bluetooth (10 segundos)...")
+        for key in self.sensor_menus:
+            self.sensor_menus[key].set('')
+            self.sensor_menus[key]['values'] = []
+            self.command_queue.put(("disconnect", key, None))
+            self.bpm_vars[key].set("--")
+        self.command_queue.put(("scan", None, None))
+
+    def _update_gui_after_scan(self, found_devices):
+        self.found_polar_devices = found_devices
+        device_list_str = [f"{SENSOR_NICKNAMES.get(d.address, d.name)} ({d.address})" for d in self.found_polar_devices]
+        
+        if len(device_list_str) >= 2:
+            for menu in self.sensor_menus.values():
+                menu['values'] = device_list_str
+            self.update_main_status("Sensores encontrados. Selecione os sensores para ver o BPM ao vivo.")
+        else:
+            self.update_main_status(f"Erro: Apenas {len(device_list_str)} sensor(es) H10 encontrado(s). Tente novamente.")
+        
+        self.scan_button.config(state=tk.NORMAL)
+
+    def on_sensor_selected(self, participant_role):
+        selection_str = self.sensor_vars[participant_role].get()
+        if not selection_str: return
+        addr = selection_str.split('(')[-1].strip(')')
+        self.update_main_status(f"Conectando ao sensor de {participant_role}...")
+        self.bpm_vars[participant_role].set("...")
+        self.command_queue.put(("connect", participant_role, addr))
+        
+        sel1 = self.sensor_vars['Indivíduo 1'].get()
+        sel2 = self.sensor_vars['Indivíduo 2'].get()
+        if sel1 and sel2 and sel1 != sel2:
+            self.start_button.config(state=tk.NORMAL)
+
+    def start_recording(self):
+        try:
+            duration_minutes = int(self.duration_var.get())
+            if duration_minutes <= 0: raise ValueError
+            self.duration_seconds = duration_minutes * 60
+        except ValueError:
+            messagebox.showerror("Erro de Validação", "A duração deve ser um número inteiro positivo.")
+            return
+
+        self.is_recording = True
+        self.master_data_log.clear()
+        self.start_button.config(state=tk.DISABLED)
+        self.scan_button.config(state=tk.DISABLED)
+        
+        self._update_timer(self.duration_seconds)
+        self.root.after(self.duration_seconds * 1000, self.stop_recording)
+
+    def stop_recording(self):
+        if not self.is_recording: return
+        self.is_recording = False
+        self.save_data()
+
+    def _update_timer(self, remaining):
+        if remaining >= 0 and self.is_recording:
+            minutes, seconds = divmod(int(remaining), 60)
+            self.timer_var.set(f"{minutes:02d}:{seconds:02d}")
+            self.root.after(1000, self._update_timer, remaining - 1)
+
+    def on_closing(self):
+        self.command_queue.put(("exit", None, None))
+        if hasattr(self, 'async_thread') and self.async_thread.is_alive():
+            self.async_thread.join(timeout=1.5)
+        self.root.destroy()
+
+    def _async_event_loop(self):
+        asyncio.run(self._async_main())
+
+    async def _async_main(self):
+        while True:
+            try:
+                command, role, address = await asyncio.get_event_loop().run_in_executor(None, self.command_queue.get)
+                if command == "exit":
+                    for task in self.active_connections.values():
+                        task.cancel()
+                    if self.active_connections:
+                        await asyncio.gather(*self.active_connections.values(), return_exceptions=True)
+                    break
+                elif command == "scan":
+                    devices = await BleakScanner.discover(timeout=10.0)
+                    polar_devices = [d for d in devices if d.name and "Polar H10" in d.name]
+                    self.root.after(0, self._update_gui_after_scan, polar_devices)
+                elif command == "connect":
+                    if role in self.active_connections:
+                        self.active_connections[role].cancel()
+                    task = asyncio.create_task(self._polar_task(role, address))
+                    self.active_connections[role] = task
+                elif command == "disconnect":
+                    if role in self.active_connections:
+                        self.active_connections[role].cancel()
+                        del self.active_connections[role]
+            except queue.Empty:
+                await asyncio.sleep(0.1)
+            except Exception as e:
+                print(f"Erro no loop de eventos: {e}")
+
+    def _notification_handler(self, role, sender, data: bytearray):
+        bpm = data[1]
+        self.root.after(0, self.bpm_vars[role].set, str(bpm))
+
+        if self.is_recording:
+            flags = data[0]
+            if (flags & 0b00010000):
+                offset = 2
+                if (flags & 1): offset += 1
+                if (flags & 8): offset += 2
+                for i in range(offset, len(data), 2):
+                    rr = int.from_bytes(data[i:i+2], "little") / 1024.0 * 1000.0
+                    self.master_data_log.append({
+                        "Timestamp_UTC (ms)": datetime.utcnow().timestamp() * 1000,
+                        "Source": role, "BPM": bpm, "RR_Interval (ms)": rr
+                    })
+    
+    async def _polar_task(self, role, address):
+        try:
+            async with BleakClient(address) as client:
+                self.root.after(0, self.update_main_status, f"Sensor de {role} conectado. Ativando notificações...")
+                await asyncio.sleep(1.0)
+                handler = partial(self._notification_handler, role)
+                await client.start_notify(HEART_RATE_MEASUREMENT_CHAR_UUID, handler)
+                self.root.after(0, self.update_main_status, f"Monitoramento ao vivo de {role} iniciado.")
+                await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.root.after(0, self.bpm_vars[role].set, "--")
+        except Exception as e:
+            print(f"Erro de conexão com {address} ({role}): {e}")
+            self.root.after(0, self.bpm_vars[role].set, "Erro")
+            self.root.after(0, self.update_main_status, f"Falha ao conectar com sensor de {role}.")
+            
+    def save_data(self):
+        self.update_main_status("Processando e salvando dados...")
+        
+        if not self.master_data_log:
+            messagebox.showwarning("Nenhum Dado", "Nenhum dado foi gravado para salvar.")
+        else:
+            filename = filedialog.asksaveasfilename(
+                title="Salvar arquivo de dados",
+                defaultextension=".xlsx",
+                filetypes=[("Arquivo Excel", "*.xlsx")]
+            )
+            if filename:
+                df = pd.DataFrame(self.master_data_log)
+
+                # --- INÍCIO DA NOVA LÓGICA DE PROCESSAMENTO ---
+                
+                # 1. Converte o timestamp para o formato datetime do pandas
+                df['datetime'] = pd.to_datetime(df['Timestamp_UTC (ms)'], unit='ms')
+                
+                # 2. Pivota a tabela para ter colunas separadas para cada sensor
+                df_pivot = df.pivot_table(index='datetime', columns='Source', values=['RR_Interval (ms)', 'BPM'])
+                
+                # 3. Reamostra os dados em janelas de 1 segundo ('1S') e calcula a média
+                df_resampled = df_pivot.resample('1S').mean()
+                
+                # 4. Achata os nomes das colunas (ex: de ('BPM', 'Indivíduo 1') para 'BPM_Indivíduo 1')
+                df_resampled.columns = ['_'.join(col) for col in df_resampled.columns.values]
+                
+                # 5. Renomeia as colunas com os nomes dos participantes
+                name1 = self.participant_vars['Indivíduo 1'].get() or "Individuo_1"
+                name2 = self.participant_vars['Indivíduo 2'].get() or "Individuo_2"
+                df_resampled = df_resampled.rename(columns={
+                    f'RR_Interval (ms)_Indivíduo 1': f'RR_{name1} (ms)', 
+                    f'RR_Interval (ms)_Indivíduo 2': f'RR_{name2} (ms)',
+                    f'BPM_Indivíduo 1': f'BPM_{name1}', 
+                    f'BPM_Indivíduo 2': f'BPM_{name2}'
+                })
+                
+                df_resampled.reset_index(inplace=True)
+                df_resampled.rename(columns={'datetime': 'Timestamp (segundo)'}, inplace=True)
+                
+                # 6. Adiciona a coluna de tempo decorrido em segundos
+                if not df_resampled.empty:
+                    start_time = df_resampled['Timestamp (segundo)'].min()
+                    df_resampled.insert(1, 'Tempo_Decorrido (s)', (df_resampled['Timestamp (segundo)'] - start_time).dt.total_seconds())
+
+                # --- FIM DA NOVA LÓGICA DE PROCESSAMENTO ---
+
+                try:
+                    # Salva o DataFrame final, reamostrado
+                    df_resampled.to_excel(filename, index=False, float_format="%.2f")
+                    messagebox.showinfo("Sucesso", f"Dados reamostrados e salvos com sucesso em:\n{filename}")
+                except Exception as e:
+                    messagebox.showerror("Erro ao Salvar", f"Não foi possível salvar o arquivo.\nErro: {e}")
+        
+        self.scan_button.config(state=tk.NORMAL)
+        self.start_button.config(state=tk.DISABLED)
+        self.update_main_status("Pronto. Busque os sensores para um novo experimento.")
+        self.timer_var.set("00:00")
+        for role in self.bpm_vars:
+             self.command_queue.put(("disconnect", role, None))
+
+if __name__ == "__main__":
+    from functools import partial
+    root = tk.Tk()
+    app = PolarHRVApp(root)
+    root.mainloop()
